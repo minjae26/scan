@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <title>분류 스캔</title>
 <meta name="robots" content="noindex">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#2f5fd0">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="분류스캔">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <script src="https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/iife/ponyfill.js"></script>
 <style>
@@ -85,6 +93,7 @@
     <div class="live"><span class="dot" id="dot"></span><span id="sync">연결 중…</span></div>
     <div class="row" style="gap:6px">
       <button id="whoBtn" title="로그인 / 로그아웃">👤 <span id="whoName">-</span></button>
+      <button id="installBtn" hidden class="primary" title="홈 화면에 앱 설치">📲 앱 설치</button>
       <button id="connBtn" title="연결 설정">⚙</button>
     </div>
   </div>
@@ -143,14 +152,25 @@
 <dialog id="connDlg"><form class="dlg" id="connForm" method="dialog">
   <h3 style="margin:0 0 6px">구글 시트 연결</h3>
   <div class="sub" style="margin-bottom:10px">관리자에게 받은 <b>연결 링크</b>로 접속하면 자동으로 채워집니다.</div>
-  <label class="sub">웹 앱 URL</label>
+  <label class="sub">연결 링크 또는 웹 앱 URL</label>
   <input id="connUrl" required placeholder="https://script.google.com/macros/s/…/exec" style="margin:4px 0 10px">
   <label class="sub">비밀 키</label>
-  <input id="connKey" required autocomplete="off" style="margin-top:4px">
+  <input id="connKey" autocomplete="off" placeholder="연결 링크를 붙여넣었다면 비워 두세요" style="margin-top:4px">
   <div class="row" style="justify-content:flex-end; margin-top:12px">
     <button type="button" id="connCancel">닫기</button><button class="primary" type="submit">연결</button>
   </div>
 </form></dialog>
+
+<dialog id="iosDlg"><div class="dlg">
+  <h3 style="margin:0 0 10px">아이폰에 앱 설치</h3>
+  <ol style="margin:0;padding-left:20px;line-height:1.9">
+    <li>사파리 아래쪽 <b>공유 버튼(□↑)</b>을 누르세요</li>
+    <li><b>홈 화면에 추가</b>를 누르세요</li>
+    <li>오른쪽 위 <b>추가</b>를 누르세요</li>
+  </ol>
+  <div class="sub" style="margin-top:10px">설치한 앱을 처음 열 때 연결 링크와 비밀번호를 한 번 더 입력해야 합니다. (아이폰은 사파리와 앱이 저장 공간을 따로 씁니다)</div>
+  <div class="row" style="justify-content:flex-end;margin-top:12px"><button id="iosClose">확인</button></div>
+</div></dialog>
 
 <dialog id="loginDlg"><form class="dlg" id="loginForm" method="dialog">
   <h3 style="margin:0 0 6px">작업자 로그인</h3>
@@ -684,13 +704,45 @@ $('#connBtn').onclick = openConnDialog;
 $('#connCancel').onclick = () => $('#connDlg').close();
 $('#connForm').onsubmit = async e => {
   e.preventDefault();
-  CFG.url = $('#connUrl').value.trim(); CFG.key = $('#connKey').value.trim();
+  const raw = $('#connUrl').value.trim();
+  const hashAt = raw.indexOf('#');
+  if (hashAt >= 0) {               // 연결 링크 전체를 붙여넣은 경우: 주소와 키를 자동으로 분리
+    const h = new URLSearchParams(raw.slice(hashAt + 1));
+    if (h.get('u')) CFG.url = h.get('u').trim();
+    if (h.get('k')) CFG.key = h.get('k').trim();
+  } else {
+    CFG.url = raw; CFG.key = $('#connKey').value.trim();
+  }
+  if (!CFG.url || !CFG.key) { alert('연결 링크를 그대로 붙여넣거나, 웹 앱 URL과 비밀 키를 모두 입력하세요.'); return; }
   try { localStorage.setItem('sort_api_url', CFG.url); localStorage.setItem('sort_api_key', CFG.key); } catch (err) {}
   $('#connDlg').close();
   if (!AUTH.token) { askLogin(); return; }
   try { await loadAll(); setSync('실시간 동기화', 'on'); }
   catch (err) { setSync('연결 실패', 'bad'); if (err.code !== 'NEED_LOGIN') alert(err.message || err); }
 };
+
+/* ───────── 홈 화면 앱 설치 ───────── */
+const isStandalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+let installEvt = null;
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+window.addEventListener('beforeinstallprompt', e => {   // 안드로이드 크롬: 설치 가능할 때만 버튼 표시
+  e.preventDefault(); installEvt = e; $('#installBtn').hidden = false;
+});
+window.addEventListener('appinstalled', () => { $('#installBtn').hidden = true; installEvt = null; });
+if (isIOS && !isStandalone) $('#installBtn').hidden = false;   // 아이폰: 설치 방법 안내
+$('#installBtn').onclick = async () => {
+  if (installEvt) {
+    installEvt.prompt();
+    try { await installEvt.userChoice; } catch (e) {}
+    installEvt = null; $('#installBtn').hidden = true;
+  } else if (isIOS) {
+    $('#iosDlg').showModal();
+  }
+};
+$('#iosClose').onclick = () => $('#iosDlg').close();
 
 /* ───────── 시작 ───────── */
 (async () => {
