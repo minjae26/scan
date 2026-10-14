@@ -243,6 +243,7 @@ async function loadAll() {
   const d = await run('getAll');
   loadRows(d.rows);
   S.logN = d.logCount;
+  S.ver = d.ver;
   S.lastSync = Date.now(); S.failCount = 0;
   renderAll();
 }
@@ -564,6 +565,12 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /* ───────── 실시간 동기화 (3초 폴링) ───────── */
+function showNotice(msg) {
+  const el = $('#result');
+  el.className = 'result wait';
+  el.innerHTML = `<div class="r-status">🔄 ${esc(msg)}</div><div class="r-sub">전체 ${S.byInv.size.toLocaleString()}건</div>`;
+  beep('dup');
+}
 function setSync(text, state) {
   $('#sync').textContent = text;
   $('#dot').className = 'dot' + (state ? ' ' + state : '');
@@ -574,7 +581,8 @@ async function poll() {
   S.polling = true;
   try {
     const u = await run('getUpdates', S.logN);
-    if (u.reload) { await loadAll(); S.feed = []; renderFeed(); }
+    if (u.reload) { await loadAll(); S.feed = []; renderFeed(); showNotice('새 작업 데이터를 불러왔습니다'); }
+    else if (u.ver && S.ver && u.ver !== S.ver) { await loadAll(); showNotice('원본 시트가 바뀌어 다시 불러왔습니다'); }
     else {
       let changed = false;
       u.ev.forEach(([at, type, inv, row, who]) => {
