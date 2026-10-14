@@ -5,7 +5,7 @@
 <title>분류 스캔</title>
 <meta name="robots" content="noindex">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/iife/ponyfill.js"></script>
 <style>
   :root { --bg:#f4f5f7; --card:#fff; --line:#e2e5e9; --text:#1b2127; --muted:#6b7480;
           --ok:#1f8a4c; --okbg:#e7f6ec; --dup:#b7791f; --dupbg:#fdf3e1; --err:#d92d20; --errbg:#fdecea; --accent:#2f5fd0; }
@@ -29,8 +29,14 @@
   button { font:inherit; padding:10px 14px; border:1px solid var(--line); border-radius:8px; background:#fff; cursor:pointer; white-space:nowrap; }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
   #scanInput { font-size:18px; padding:14px; }
-  #reader { margin-top:10px; border-radius:8px; overflow:hidden; background:#000; }
-  #reader video { width:100% !important; max-height:40vh; object-fit:cover; display:block; }
+  #reader { margin-top:10px; border-radius:10px; overflow:hidden; background:#000; position:relative; }
+  #camVideo { width:100%; height:42vh; object-fit:cover; display:block; }
+  #guide { position:absolute; inset:6px; border:3px solid transparent; border-radius:10px; pointer-events:none; }
+  #guide.ok { animation: gOk .6s; } #guide.bad { animation: gBad .6s; }
+  @keyframes gOk { from { border-color:#2fd16b; background:rgba(47,209,107,.28); } }
+  @keyframes gBad { from { border-color:#ffb020; } }
+  #camMsg { position:absolute; left:8px; right:8px; bottom:8px; color:#fff; font-size:12px; text-align:center;
+            text-shadow:0 1px 2px #000; }
   button.cam { font-size:16px; padding:12px 16px; }
   #scanInput { flex:1; min-width:0; }
   @media (max-width:520px) { #scanInput { font-size:15px; padding:12px; } }
@@ -88,8 +94,15 @@
       <button id="torchBtn" hidden>🔦 플래시</button>
       <input id="scanInput" placeholder="송장번호 직접 입력 후 Enter" autocomplete="off" autocapitalize="off" spellcheck="false" inputmode="numeric">
     </div>
-    <div id="reader" hidden></div>
-    <div class="sub" id="camHint" style="margin-top:6px">바코드를 가로로 화면 가운데 상자에 맞추면 자동으로 인식됩니다.</div>
+    <div id="reader" hidden>
+      <video id="camVideo" playsinline muted autoplay></video>
+      <div id="guide"></div>
+      <div id="camMsg"></div>
+    </div>
+    <div class="row" id="zoomRow" hidden style="margin-top:8px">
+      <span class="sub" style="white-space:nowrap">확대</span><input type="range" id="zoom" style="padding:0">
+    </div>
+    <div class="sub" id="camHint" style="margin-top:6px">화면 안 어디에 있든 송장 바코드가 보이면 자동으로 인식됩니다. 작아서 안 읽히면 확대를 조금 올리거나 조금 더 가까이 대 보세요.</div>
   </div>
 
   <div class="result" id="result">
@@ -202,7 +215,7 @@ function beep(kind) {
     const o = actx.createOscillator(), g = actx.createGain();
     o.frequency.value = tones[0]; g.gain.value = .1; o.connect(g); g.connect(actx.destination);
     o.start(); o.stop(actx.currentTime + tones[1]);
-    if (navigator.vibrate && kind !== 'ok') navigator.vibrate(kind === 'err' ? [120, 60, 120] : 150);
+    if (navigator.vibrate) navigator.vibrate(kind === 'ok' ? 40 : kind === 'err' ? [120, 60, 120] : 150);
   } catch (e) {}
 }
 
@@ -372,66 +385,151 @@ document.addEventListener('click', e => {
   if (!e.target.closest('input,select,button,dialog,tr.click')) refocus();
 });
 
-/* ───────── 휴대폰 카메라 스캔 ───────── */
-let cam = null, lastCode = '', lastAt = 0, torchOn = false;
+/* ───────── 휴대폰 카메라 스캔 ─────────
+ * 안드로이드 크롬: 기기 내장 BarcodeDetector (빠르고 정확)
+ * 아이폰 등 미지원 기기: ZXing-C++(wasm) 기반 barcode-detector 라이브러리
+ * 고해상도 + 연속 자동초점 + 확대(줌) + 안내 상자 영역만 판독
+ */
+const BC_FORMATS = ['code_128', 'code_39', 'code_93', 'ean_13', 'ean_8', 'itf', 'codabar', 'qr_code'];
+let cam = false, stream = null, track = null, detector = null, loopTimer = null, busy = false, torchOn = false;
+const recent = new Map();   // 최근 인식한 코드 -> 시각 (같은 물건 반복 처리 방지)
+const cropCanvas = document.createElement('canvas');
+const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
 
-function camConfig() {
-  const F = window.Html5QrcodeSupportedFormats || {};
-  const formats = ['CODE_128', 'CODE_39', 'CODE_93', 'EAN_13', 'EAN_8', 'ITF', 'CODABAR', 'QR_CODE']
-    .map(k => F[k]).filter(v => v !== undefined);
-  return {
-    verbose: false,
-    formatsToSupport: formats.length ? formats : undefined,
-    experimentalFeatures: { useBarCodeDetectorIfSupported: true }, // 안드로이드 크롬 고속 인식
-  };
+async function makeDetector() {
+  if ('BarcodeDetector' in window) {
+    try {
+      const sup = await window.BarcodeDetector.getSupportedFormats();
+      const f = BC_FORMATS.filter(x => sup.includes(x));
+      if (f.includes('code_128')) return new window.BarcodeDetector({ formats: f });
+    } catch (e) {}
+  }
+  const API = window.BarcodeDetectionAPI;
+  if (!API || !API.BarcodeDetector) throw new Error('no-lib');
+  return new API.BarcodeDetector({ formats: BC_FORMATS });
 }
 
+function lsGet(k, d) { try { return localStorage.getItem(k) ?? d; } catch (e) { return d; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
 async function startCam() {
-  if (typeof Html5Qrcode === 'undefined') { showCamError('스캐너 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하세요.'); return; }
-  $('#reader').hidden = false;
-  cam = new Html5Qrcode('reader', camConfig());
+  if (cam) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { showCamError('이 브라우저는 카메라를 지원하지 않습니다. 크롬이나 사파리로 열어 주세요.'); return; }
+  try { if (!detector) detector = await makeDetector(); }
+  catch (e) { showCamError('바코드 인식기를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침하세요.'); return; }
+
   try {
-    await cam.start(
-      { facingMode: 'environment' },
-      {
-        fps: 15,
-        qrbox: (w, h) => ({ width: Math.floor(w * 0.9), height: Math.floor(Math.min(h, w) * 0.4) }), // 가로로 긴 송장 바코드용
-        aspectRatio: 1.333,
-      },
-      code => {
-        const now = Date.now();
-        if (code === lastCode && now - lastAt < 2500) return; // 같은 송장 연속 인식 방지
-        lastCode = code; lastAt = now;
-        doScan(code);
-      });
-    $('#camBtn').textContent = '■ 끄기';
-    $('#torchBtn').hidden = !canTorch();
-    try { localStorage.setItem('sort_cam', '1'); } catch (e) {}
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    });
   } catch (e) {
-    cam = null; $('#reader').hidden = true;
-    const name = (e && (e.name || e)) + '';
-    if (/NotAllowed|Permission/i.test(name)) {
-      showCamError('카메라 권한이 거부됐습니다. 주소창 왼쪽 자물쇠(또는 설정 > 사이트 설정 > 카메라)에서 이 사이트의 카메라를 "허용"으로 바꾼 뒤 새로고침하세요.');
-    } else if (/NotFound|Overconstrained/i.test(name)) {
-      showCamError('후면 카메라를 찾을 수 없습니다.');
-    } else if (/NotReadable/i.test(name)) {
-      showCamError('다른 앱이 카메라를 사용 중입니다. 카메라 앱을 종료하고 다시 시도하세요.');
-    } else {
-      showCamError('카메라를 열 수 없습니다: ' + name);
-    }
+    const name = (e && e.name) || String(e);
+    if (/NotAllowed|Permission/i.test(name)) showCamError('카메라 권한이 거부됐습니다. 주소창 왼쪽 자물쇠(또는 설정 > 사이트 설정 > 카메라)에서 "허용"으로 바꾼 뒤 새로고침하세요.');
+    else if (/NotFound|Overconstrained/i.test(name)) showCamError('후면 카메라를 찾을 수 없습니다.');
+    else if (/NotReadable/i.test(name)) showCamError('다른 앱이 카메라를 사용 중입니다. 카메라 앱을 종료하고 다시 시도하세요.');
+    else showCamError('카메라를 열 수 없습니다: ' + name);
+    return;
+  }
+
+  track = stream.getVideoTracks()[0];
+  const caps = (track.getCapabilities && track.getCapabilities()) || {};
+  try {
+    if (caps.focusMode && caps.focusMode.includes('continuous')) await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+  } catch (e) {}
+
+  // 확대(줌): 작은 바코드는 살짝 확대하면 초점이 잘 맞음
+  const z = $('#zoom');
+  if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+    z.min = caps.zoom.min; z.max = Math.min(caps.zoom.max, 5); z.step = caps.zoom.step || 0.1;
+    const saved = parseFloat(lsGet('sort_zoom', ''));
+    const val = isFinite(saved) ? saved : Math.min(Math.max(caps.zoom.min, 1.5), +z.max);
+    z.value = Math.min(Math.max(val, caps.zoom.min), +z.max);
+    applyZoom(+z.value);
+    $('#zoomRow').hidden = false;
+  } else { $('#zoomRow').hidden = true; }
+  $('#torchBtn').hidden = !caps.torch;
+
+  const v = $('#camVideo');
+  v.srcObject = stream;
+  try { await v.play(); } catch (e) {}
+  cam = true;
+  $('#reader').hidden = false;
+  $('#camBtn').textContent = '■ 끄기';
+  $('#camMsg').textContent = '';
+  lsSet('sort_cam', '1');
+  tick();
+}
+
+async function applyZoom(val) {
+  try { await track.applyConstraints({ advanced: [{ zoom: val }] }); lsSet('sort_zoom', String(val)); } catch (e) {}
+}
+
+function stopCam(keepPref) {
+  clearTimeout(loopTimer); loopTimer = null;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; track = null; cam = false; torchOn = false;
+  $('#camVideo').srcObject = null;
+  $('#reader').hidden = true; $('#torchBtn').hidden = true; $('#zoomRow').hidden = true;
+  $('#torchBtn').textContent = '🔦 플래시';
+  $('#camBtn').textContent = '📷 카메라';
+  if (!keepPref) lsSet('sort_cam', '0');
+}
+
+/** 화면 전체를 판독 (상자에 맞추지 않아도 어디에 있든, 기울어져도 인식).
+ *  너무 큰 프레임만 1920px로 줄여 속도 유지. 라벨에 바코드가 여러 개면 handleCodes가 송장만 골라냄 */
+function grabFrame(v) {
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw || !vh) return null;
+  const k = Math.min(1, 1920 / Math.max(vw, vh));
+  const cw = Math.round(vw * k), ch = Math.round(vh * k);
+  if (cropCanvas.width !== cw) cropCanvas.width = cw;
+  if (cropCanvas.height !== ch) cropCanvas.height = ch;
+  cropCtx.drawImage(v, 0, 0, vw, vh, 0, 0, cw, ch);
+  return cropCanvas;
+}
+
+async function tick() {
+  if (!cam) return;
+  const v = $('#camVideo');
+  if (!busy && v.readyState >= 2) {
+    busy = true;
+    try {
+      const src = grabFrame(v);
+      if (src) {
+        const found = await detector.detect(src);
+        handleCodes(found.map(c => String(c.rawValue || '').trim()).filter(Boolean));
+      }
+    } catch (e) {}
+    busy = false;
+  }
+  loopTimer = setTimeout(tick, 60);
+}
+
+function handleCodes(list) {
+  if (!list.length) return;
+  const now = Date.now();
+  // 한 라벨에 바코드가 여러 개면, 목록에 있는 송장 바코드를 우선
+  const known = list.find(c => findLocal(c));
+  const code = known || list[0];
+  const last = recent.get(code);
+  recent.set(code, now);
+  if (last && now - last < 3000) return;          // 카메라에 계속 비치는 동안은 한 번만 처리
+  if (recent.size > 300) [...recent.keys()].slice(0, 150).forEach(k => recent.delete(k));
+
+  if (known) {
+    guideFlash('ok');
+    $('#camMsg').textContent = '';
+    doScan(code);
+  } else {
+    guideFlash('bad');
+    $('#camMsg').textContent = '목록에 없는 바코드: ' + code + ' — 송장(신청서번호) 바코드를 비춰 주세요';
   }
 }
 
-async function stopCam() {
-  if (!cam) return;
-  try { await cam.stop(); cam.clear(); } catch (e) {}
-  cam = null; torchOn = false;
-  $('#reader').hidden = true; $('#torchBtn').hidden = true; $('#camBtn').textContent = '📷 카메라';
-  try { localStorage.setItem('sort_cam', '0'); } catch (e) {}
-}
-
-function canTorch() {
-  try { const c = cam.getRunningTrackCapabilities(); return !!(c && c.torch); } catch (e) { return false; }
+function guideFlash(kind) {
+  const g = $('#guide');
+  g.classList.remove('ok', 'bad'); void g.offsetWidth; g.classList.add(kind);
 }
 
 function showCamError(msg) {
@@ -442,18 +540,19 @@ function showCamError(msg) {
 }
 
 $('#camBtn').onclick = () => cam ? stopCam() : startCam();
+$('#zoom').oninput = e => applyZoom(+e.target.value);
 $('#torchBtn').onclick = async () => {
-  if (!cam) return;
-  try { torchOn = !torchOn; await cam.applyVideoConstraints({ advanced: [{ torch: torchOn }] }); $('#torchBtn').textContent = torchOn ? '🔦 끄기' : '🔦 플래시'; }
-  catch (e) { torchOn = false; }
+  if (!track) return;
+  try {
+    torchOn = !torchOn;
+    await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+    $('#torchBtn').textContent = torchOn ? '🔦 끄기' : '🔦 플래시';
+  } catch (e) { torchOn = false; }
 };
-// 화면이 꺼졌다 켜지면 카메라 다시 연결
+// 화면이 꺼지면 카메라를 끄고, 다시 켜지면 자동으로 다시 연결
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && cam) { stopCam().then(() => { try { localStorage.setItem('sort_cam', '1'); } catch (e) {} }); }
-  else if (!document.hidden && !cam && !isDesktop) {
-    let p = '0'; try { p = localStorage.getItem('sort_cam') || '0'; } catch (e) {}
-    if (p === '1') startCam();
-  }
+  if (document.hidden && cam) stopCam(true);
+  else if (!document.hidden && !cam && !isDesktop && lsGet('sort_cam', '0') === '1' && S.who) startCam();
 });
 
 /* ───────── 실시간 동기화 (3초 폴링) ───────── */
