@@ -34,7 +34,9 @@
   #guide { position:absolute; inset:6px; border:3px solid transparent; border-radius:10px; pointer-events:none; }
   #guide.ok { animation: gOk .6s; } #guide.bad { animation: gBad .6s; }
   @keyframes gOk { from { border-color:#2fd16b; background:rgba(47,209,107,.28); } }
-  @keyframes gBad { from { border-color:#ffb020; } }
+  #guide.bad { animation: gBad 1.2s; }
+  @keyframes gBad { 0%,60% { border-color:#ff3b30; border-width:6px; background:rgba(255,59,48,.30); } }
+  .cam-bad { display:inline-block; background:#d92d20; color:#fff; font-weight:700; font-size:14px; padding:4px 10px; border-radius:6px; text-shadow:none; }
   #camMsg { position:absolute; left:8px; right:8px; bottom:8px; color:#fff; font-size:12px; text-align:center;
             text-shadow:0 1px 2px #000; }
   button.cam { font-size:16px; padding:12px 16px; }
@@ -43,7 +45,8 @@
   .result { border-radius:12px; padding:18px; text-align:center; border:2px solid var(--line); background:var(--card); min-height:150px; }
   .result.ok { border-color:var(--ok); background:var(--okbg); }
   .result.dup { border-color:var(--dup); background:var(--dupbg); }
-  .result.err { border-color:var(--err); background:var(--errbg); }
+  .result.err { border-color:var(--err); background:#ffd9d6; border-width:3px; }
+  .err .r-label { color:var(--err); }
   .result.wait { border-color:var(--accent); }
   .r-status { font-size:14px; font-weight:700; letter-spacing:.02em; }
   .ok .r-status { color:var(--ok); } .dup .r-status { color:var(--dup); } .err .r-status { color:var(--err); } .wait .r-status { color:var(--accent); }
@@ -64,6 +67,7 @@
   .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:99px; color:#fff; }
   .tag.스캔 { background:var(--ok); } .tag.취소 { background:var(--err); }
   .done td { color:var(--muted); }
+  tr.fresh td { animation: fresh 3s; } @keyframes fresh { from { background:#c9f0d6; } }
   tr.click { cursor:pointer; }
   .empty { text-align:center; color:var(--muted); padding:20px 0; }
   dialog { border:0; border-radius:12px; padding:0; width:min(560px,94vw); max-height:85vh; }
@@ -308,10 +312,11 @@ function openOrder(order) {
   const st = orderStat(order);
   $('#dlgTitle').textContent = `${order} · ${o.prefix} (${st.done}/${st.total})`;
   const rows = [...o.rows].sort((a, b) => a.scanned - b.scanned || (+a.stop) - (+b.stop));
-  $('#dlgBody').innerHTML = rows.map(r => `<tr class="${r.scanned ? 'done' : ''}"><td><b>${esc(r.label)}</b></td>
+  const fresh = Date.now() - 4000;
+  $('#dlgBody').innerHTML = rows.map(r => `<tr class="${r.scanned ? 'done' : ''} ${r.scanned && r.changedAt > fresh ? 'fresh' : ''}"><td><b>${esc(r.label)}</b></td>
       <td>${esc(r.addr)}<div class="sub">${esc(r.name)} · ${esc(r.inv)}</div></td>
       <td>${r.scanned ? `✓ ${esc(r.by)}<div class="sub">${esc(r.at)}</div>` : '<span style="color:var(--err)">미스캔</span>'}</td></tr>`).join('');
-  $('#orderDlg').showModal();
+  if (!$('#orderDlg').open) $('#orderDlg').showModal();
   S.openOrder = order;
 }
 $('#dlgClose').onclick = () => { $('#orderDlg').close(); S.openOrder = null; refocus(); };
@@ -523,7 +528,10 @@ function handleCodes(list) {
     doScan(code);
   } else {
     guideFlash('bad');
-    $('#camMsg').textContent = '목록에 없는 바코드: ' + code + ' — 송장(신청서번호) 바코드를 비춰 주세요';
+    $('#camMsg').innerHTML = '<span class="cam-bad">✕ 목록에 없는 바코드</span>';
+    showResult('err', null, code);
+    $('#result').querySelector('.r-sub').textContent = '시트에 없는 바코드입니다. 라벨의 송장(신청서번호) 바코드를 비춰 주세요.';
+    beep('err');
   }
 }
 
@@ -571,8 +579,8 @@ async function poll() {
       let changed = false;
       u.ev.forEach(([at, type, inv, row, who]) => {
         const r = S.byInv.get(inv); if (!r) return;
-        if (type === '스캔') Object.assign(r, { scanned: true, at, by: who });
-        else if (type === '취소') Object.assign(r, { scanned: false, at: '', by: '' });
+        if (type === '스캔') Object.assign(r, { scanned: true, at, by: who, changedAt: Date.now() });
+        else if (type === '취소') Object.assign(r, { scanned: false, at: '', by: '', changedAt: Date.now() });
         // 내가 방금 올린 이벤트는 피드에 이미 있으므로 중복 추가하지 않음
         const mineIdx = S.feed.findIndex(f => f.mine && f.inv === inv && f.type === type);
         if (mineIdx >= 0) S.feed[mineIdx].mine = false;
