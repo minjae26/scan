@@ -40,6 +40,7 @@
   #camMsg { position:absolute; left:8px; right:8px; bottom:8px; color:#fff; font-size:12px; text-align:center;
             text-shadow:0 1px 2px #000; }
   button.cam { font-size:16px; padding:12px 16px; }
+  button.sleep { display:block; width:100%; margin-top:10px; padding:28px 12px; font-size:17px; font-weight:700; background:#1b2127; color:#fff; border:0; border-radius:10px; }
   #scanInput { flex:1; min-width:0; }
   @media (max-width:520px) { #scanInput { font-size:15px; padding:12px; } }
   .result { border-radius:12px; padding:18px; text-align:center; border:2px solid var(--line); background:var(--card); min-height:150px; }
@@ -83,7 +84,7 @@
     <h1>분류 스캔</h1>
     <div class="live"><span class="dot" id="dot"></span><span id="sync">연결 중…</span></div>
     <div class="row" style="gap:6px">
-      <button id="whoBtn" title="작업자 변경">👤 <span id="whoName">-</span></button>
+      <button id="whoBtn" title="로그인 / 로그아웃">👤 <span id="whoName">-</span></button>
       <button id="connBtn" title="연결 설정">⚙</button>
     </div>
   </div>
@@ -103,10 +104,11 @@
       <div id="guide"></div>
       <div id="camMsg"></div>
     </div>
+    <button id="sleepBtn" hidden class="sleep">💤 절전 중 — 눌러서 카메라 켜기</button>
     <div class="row" id="zoomRow" hidden style="margin-top:8px">
       <span class="sub" style="white-space:nowrap">확대</span><input type="range" id="zoom" style="padding:0">
     </div>
-    <div class="sub" id="camHint" style="margin-top:6px">화면 안 어디에 있든 송장 바코드가 보이면 자동으로 인식됩니다. 작아서 안 읽히면 확대를 조금 올리거나 조금 더 가까이 대 보세요.</div>
+    <div class="sub" id="camHint" style="margin-top:6px">화면 안 어디에 있든 송장 바코드가 보이면 자동으로 인식됩니다. 1분 동안 스캔이 없으면 발열을 줄이려고 카메라가 꺼집니다.</div>
   </div>
 
   <div class="result" id="result">
@@ -150,11 +152,11 @@
   </div>
 </form></dialog>
 
-<dialog id="whoDlg"><form class="dlg" id="whoForm" method="dialog">
-  <h3 style="margin:0 0 6px">작업자 이름</h3>
-  <div class="sub" style="margin-bottom:10px">스캔 기록에 남고 다른 작업자 화면에 표시됩니다.</div>
-  <input id="whoInput" required placeholder="예) 노민재">
-  <div class="row" style="justify-content:flex-end; margin-top:12px"><button class="primary" type="submit">시작</button></div>
+<dialog id="loginDlg"><form class="dlg" id="loginForm" method="dialog">
+  <h3 style="margin:0 0 6px">작업자 로그인</h3>
+  <div class="sub" id="loginMsg" style="margin-bottom:10px"></div>
+  <input id="pinInput" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="비밀번호" style="font-size:22px;letter-spacing:6px;text-align:center">
+  <div class="row" style="justify-content:flex-end; margin-top:12px"><button class="primary" type="submit" id="loginBtn">로그인</button></div>
 </form></dialog>
 
 <script>
@@ -185,25 +187,49 @@ const CFG = { url: '', key: '' };
   }
 })();
 
-const API_ARGS = { getAll: [], scan: ['code', 'who'], cancelScan: ['inv', 'who'], getUpdates: ['n'] };
+const API_ARGS = { getAll: [], scan: ['code'], cancelScan: ['inv'], getUpdates: ['n'], login: ['pin'] };
 async function run(fn, ...args) {
   if (!CFG.url || !CFG.key) throw new Error('연결 정보가 없습니다. 관리자에게 받은 연결 링크로 접속하세요.');
-  const p = new URLSearchParams({ action: fn, key: CFG.key, t: Date.now() });
-  API_ARGS[fn].forEach((k, i) => p.set(k, args[i] ?? ''));
+  const body = { action: fn, key: CFG.key, token: AUTH.token };
+  API_ARGS[fn].forEach((k, i) => body[k] = args[i] ?? '');
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 20000);
   try {
-    const res = await fetch(CFG.url + (CFG.url.includes('?') ? '&' : '?') + p, { redirect: 'follow', signal: ctrl.signal });
+    // text/plain 본문: 키·토큰이 주소창·방문 기록에 남지 않음
+    const res = await fetch(CFG.url, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'text/plain;charset=utf-8' }, redirect: 'follow', signal: ctrl.signal });
     const text = await res.text();
     let j;
     try { j = JSON.parse(text); }
-    catch (e) { throw new Error('구글 응답을 읽지 못했습니다. 웹 앱 액세스 권한이 "모든 사용자"인지 확인하세요.'); }
-    if (!j.ok) throw new Error(j.error);
+    catch (e) { throw new Error('구글 응답을 읽지 못했습니다. 웹 앱이 새 버전으로 배포됐는지, 액세스가 "모든 사용자"인지 확인하세요.'); }
+    if (!j.ok) {
+      const err = new Error(j.error); err.code = j.code;
+      if (j.code === 'NEED_LOGIN' && fn !== 'login') onLoggedOut();
+      throw err;
+    }
     return j.data;
   } catch (e) {
     if (e.name === 'AbortError') throw new Error('응답이 늦습니다. 네트워크를 확인하세요.');
     throw e;
   } finally { clearTimeout(timer); }
+}
+
+/* ───────── 작업자 로그인 (휴대폰마다 처음 한 번) ───────── */
+const AUTH = { token: '', name: '' };
+try { AUTH.token = localStorage.getItem('sort_token') || ''; AUTH.name = localStorage.getItem('sort_name') || ''; } catch (e) {}
+
+function onLoggedOut() {
+  AUTH.token = ''; AUTH.name = ''; S.who = '';
+  try { localStorage.removeItem('sort_token'); localStorage.removeItem('sort_name'); } catch (e) {}
+  $('#whoName').textContent = '로그인';
+  if (typeof stopCam === 'function' && cam) stopCam(true);
+  askLogin('로그인이 필요합니다. 비밀번호를 입력하세요.');
+}
+
+function askLogin(msg) {
+  $('#loginMsg').textContent = msg || '관리자에게 받은 작업자 비밀번호(4~6자리)를 입력하세요.';
+  $('#pinInput').value = '';
+  if (!$('#loginDlg').open) $('#loginDlg').showModal();
+  setTimeout(() => $('#pinInput').focus(), 50);
 }
 
 function openConnDialog() {
@@ -340,11 +366,12 @@ $('#orderFilter').onchange = renderOrders;
 
 /* ───────── 스캔 ───────── */
 function refocus() {
-  if (isDesktop && !$('#orderDlg').open && !$('#whoDlg').open && !$('#connDlg').open) $('#scanInput').focus();
+  if (isDesktop && !$('#orderDlg').open && !$('#loginDlg').open && !$('#connDlg').open) $('#scanInput').focus();
 }
 
 async function doScan(raw) {
   const code = String(raw).trim(); if (!code) return;
+  lastActive = Date.now();
   if (!S.who) { askWho(); return; }
   const local = findLocal(code);
 
@@ -353,7 +380,7 @@ async function doScan(raw) {
   if (local) showResult('wait', local);
 
   try {
-    const res = await run('scan', code, S.who);
+    const res = await run('scan', code);
     if (res.status === 'notfound') { showResult('err', null, code); beep('err'); return; }
     const r = S.byInv.get(res.info.inv) || local;
     if (r) Object.assign(r, { scanned: !!res.info.scanned, at: res.info.at, by: res.info.by });
@@ -372,7 +399,7 @@ async function doScan(raw) {
 async function undo(inv) {
   if (!confirm('이 스캔을 취소할까요?')) return;
   try {
-    const res = await run('cancelScan', inv, S.who);
+    const res = await run('cancelScan', inv);
     const r = S.byInv.get(inv);
     if (r && res.status === 'ok') {
       Object.assign(r, { scanned: false, at: '', by: '' });
@@ -398,6 +425,9 @@ document.addEventListener('click', e => {
  */
 const BC_FORMATS = ['code_128', 'code_39', 'code_93', 'ean_13', 'ean_8', 'itf', 'codabar', 'qr_code'];
 let cam = false, stream = null, track = null, detector = null, loopTimer = null, busy = false, torchOn = false;
+const SCAN_INTERVAL = 180;      // 판독 간격(ms): 1초에 약 5회 — 발열 절감
+const IDLE_MS = 60 * 1000;       // 1분 동안 바코드가 안 보이면 카메라 자동 꺼짐
+let lastActive = Date.now();
 const recent = new Map();   // 최근 인식한 코드 -> 시각 (같은 물건 반복 처리 방지)
 const cropCanvas = document.createElement('canvas');
 const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
@@ -427,7 +457,7 @@ async function startCam() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 20 } },
     });
   } catch (e) {
     const name = (e && e.name) || String(e);
@@ -464,6 +494,8 @@ async function startCam() {
   $('#camBtn').textContent = '■ 끄기';
   $('#camMsg').textContent = '';
   lsSet('sort_cam', '1');
+  lastActive = Date.now();
+  $('#sleepBtn').hidden = true;
   tick();
 }
 
@@ -472,6 +504,7 @@ async function applyZoom(val) {
 }
 
 function stopCam(keepPref) {
+  $('#sleepBtn').hidden = true;
   clearTimeout(loopTimer); loopTimer = null;
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; track = null; cam = false; torchOn = false;
@@ -487,7 +520,7 @@ function stopCam(keepPref) {
 function grabFrame(v) {
   const vw = v.videoWidth, vh = v.videoHeight;
   if (!vw || !vh) return null;
-  const k = Math.min(1, 1920 / Math.max(vw, vh));
+  const k = Math.min(1, 1280 / Math.max(vw, vh));
   const cw = Math.round(vw * k), ch = Math.round(vh * k);
   if (cropCanvas.width !== cw) cropCanvas.width = cw;
   if (cropCanvas.height !== ch) cropCanvas.height = ch;
@@ -509,11 +542,13 @@ async function tick() {
     } catch (e) {}
     busy = false;
   }
-  loopTimer = setTimeout(tick, 60);
+  if (Date.now() - lastActive > IDLE_MS) { sleepCam(); return; }
+  loopTimer = setTimeout(tick, SCAN_INTERVAL);
 }
 
 function handleCodes(list) {
   if (!list.length) return;
+  lastActive = Date.now();
   const now = Date.now();
   // 한 라벨에 바코드가 여러 개면, 목록에 있는 송장 바코드를 우선
   const known = list.find(c => findLocal(c));
@@ -548,6 +583,11 @@ function showCamError(msg) {
   beep('err');
 }
 
+function sleepCam() {
+  stopCam(true);
+  $('#sleepBtn').hidden = false;
+}
+$('#sleepBtn').onclick = () => startCam();
 $('#camBtn').onclick = () => cam ? stopCam() : startCam();
 $('#zoom').oninput = e => applyZoom(+e.target.value);
 $('#torchBtn').onclick = async () => {
@@ -577,7 +617,7 @@ function setSync(text, state) {
 }
 
 async function poll() {
-  if (S.polling) return;
+  if (S.polling || !AUTH.token || !CFG.key) return;
   S.polling = true;
   try {
     const u = await run('getUpdates', S.logN);
@@ -614,13 +654,29 @@ setInterval(() => {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 
 /* ───────── 작업자 ───────── */
-function askWho() { $('#whoInput').value = S.who; $('#whoDlg').showModal(); $('#whoInput').focus(); }
-$('#whoBtn').onclick = askWho;
-$('#whoForm').onsubmit = e => {
+function askWho() { askLogin(); }
+$('#whoBtn').onclick = () => {
+  if (!AUTH.token) { askLogin(); return; }
+  if (confirm(AUTH.name + ' 님, 로그아웃할까요?')) onLoggedOut();
+};
+$('#loginForm').onsubmit = async e => {
   e.preventDefault();
-  S.who = $('#whoInput').value.trim(); if (!S.who) return;
-  try { localStorage.setItem('sort_who', S.who); } catch (err) {}
-  $('#whoName').textContent = S.who; $('#whoDlg').close(); refocus();
+  const pin = $('#pinInput').value.trim();
+  if (!/^\d{4,6}$/.test(pin)) { $('#loginMsg').textContent = '4~6자리 숫자를 입력하세요.'; return; }
+  $('#loginBtn').disabled = true;
+  try {
+    const r = await run('login', pin);
+    AUTH.token = r.token; AUTH.name = r.name; S.who = r.name;
+    try { localStorage.setItem('sort_token', r.token); localStorage.setItem('sort_name', r.name); } catch (err) {}
+    $('#whoName').textContent = r.name;
+    $('#loginDlg').close();
+    await loadAll(); setSync('실시간 동기화', 'on');
+    refocus();
+  } catch (err) {
+    $('#loginMsg').textContent = err.message || String(err);
+    $('#pinInput').value = ''; $('#pinInput').focus();
+    beep('err');
+  } finally { $('#loginBtn').disabled = false; }
 };
 
 /* ───────── 연결 설정 ───────── */
@@ -631,22 +687,24 @@ $('#connForm').onsubmit = async e => {
   CFG.url = $('#connUrl').value.trim(); CFG.key = $('#connKey').value.trim();
   try { localStorage.setItem('sort_api_url', CFG.url); localStorage.setItem('sort_api_key', CFG.key); } catch (err) {}
   $('#connDlg').close();
-  try { await loadAll(); setSync('실시간 동기화', 'on'); if (!S.who) askWho(); }
-  catch (err) { setSync('연결 실패', 'bad'); alert(err.message || err); }
+  if (!AUTH.token) { askLogin(); return; }
+  try { await loadAll(); setSync('실시간 동기화', 'on'); }
+  catch (err) { setSync('연결 실패', 'bad'); if (err.code !== 'NEED_LOGIN') alert(err.message || err); }
 };
 
 /* ───────── 시작 ───────── */
 (async () => {
-  try { S.who = localStorage.getItem('sort_who') || ''; } catch (e) {}
-  $('#whoName').textContent = S.who || '-';
+  S.who = AUTH.name;
+  $('#whoName').textContent = AUTH.name || '로그인';
   if (!CFG.url || !CFG.key) { setSync('연결 정보 없음', 'bad'); openConnDialog(); return; }
+  if (!AUTH.token) { setSync('로그인 필요', 'bad'); askLogin(); return; }
   try { await loadAll(); setSync('실시간 동기화', 'on'); }
-  catch (e) { setSync('불러오기 실패', 'bad'); alert(e.message || e); }
-  if (!S.who) askWho(); else refocus();
+  catch (e) { setSync('불러오기 실패', 'bad'); if (e.code !== 'NEED_LOGIN') alert(e.message || e); return; }
+  refocus();
   // 휴대폰에서 지난번에 카메라를 쓰고 있었다면 자동으로 켜기
   let camPref = '0';
   try { camPref = localStorage.getItem('sort_cam') || '0'; } catch (e) {}
-  if (!isDesktop && camPref === '1' && S.who) startCam();
+  if (!isDesktop && camPref === '1') startCam();
 })();
 </script>
 </body>
