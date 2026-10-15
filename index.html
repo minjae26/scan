@@ -498,7 +498,73 @@ let cam = false, stream = null, track = null, detector = null, loopTimer = null,
 const FAST_MS = 70;              // 스캔하는 동안: 1초에 약 12~14회 확인
 const SLOW_MS = 220;             // 20초 동안 바코드가 없으면: 1초에 약 4회 (발열 절감)
 const FAST_WINDOW = 20 * 1000;
-let lastHit = 0, useVideoDirect = true;
+const DETECT_MAX = 960;          // 판독용 크기(px): 1280과 인식률 같고 최대 4배 빠름 (800은 인식률 떨어짐)
+let lastHit = 0;
+
+/* 판독은 화면과 분리된 백그라운드(웹 워커)에서 → 카메라 화면이 끊기지 않음 */
+const WORKER_SRC = `
+let det = null;
+async function init(F) {
+  if ('BarcodeDetector' in self) {
+    try {
+      const sup = await self.BarcodeDetector.getSupportedFormats();
+      const f = F.filter(x => sup.includes(x));
+      if (f.includes('code_128')) { det = new self.BarcodeDetector({ formats: f }); return 'native'; }
+    } catch (e) {}
+  }
+  importScripts('https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/dist/iife/ponyfill.js');
+  det = new self.BarcodeDetectionAPI.BarcodeDetector({ formats: F });
+  await det.detect(new ImageData(8, 8));           // 인식 엔진 미리 불러오기
+  return 'zxing';
+}
+self.onmessage = async e => {
+  const m = e.data;
+  if (m.type === 'init') {
+    try { postMessage({ type: 'ready', kind: await init(m.formats) }); }
+    catch (err) { postMessage({ type: 'fail', error: String(err) }); }
+    return;
+  }
+  if (m.type === 'frame') {
+    const t = performance.now();
+    let codes = [];
+    try {
+      const r = await det.detect(new ImageData(new Uint8ClampedArray(m.buf), m.w, m.h));
+      codes = r.map(x => String(x.rawValue || '').trim()).filter(Boolean);
+    } catch (err) {}
+    postMessage({ type: 'result', codes, ms: performance.now() - t });
+  }
+};`;
+let worker = null, workerFailed = false, inflight = false, inflightAt = 0, lastDetectMs = 30;
+
+function startWorker() {
+  if (worker) return Promise.resolve(true);
+  if (workerFailed || typeof Worker === 'undefined') return Promise.resolve(false);
+  return new Promise(res => {
+    let w;
+    const fail = () => { try { w && w.terminate(); } catch (e) {} workerFailed = true; res(false); };
+    try {
+      w = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })));
+      const to = setTimeout(fail, 15000);
+      w.onmessage = e => {
+        if (e.data.type === 'ready') {
+          clearTimeout(to); worker = w;
+          w.onmessage = onWorkerMsg;
+          w.onerror = () => { worker = null; workerFailed = true; inflight = false; };
+          res(true);
+        } else if (e.data.type === 'fail') { clearTimeout(to); fail(); }
+      };
+      w.onerror = () => { clearTimeout(to); fail(); };
+      w.postMessage({ type: 'init', formats: BC_FORMATS });
+    } catch (e) { fail(); }
+  });
+}
+
+function onWorkerMsg(e) {
+  const m = e.data; if (m.type !== 'result') return;
+  inflight = false;
+  lastDetectMs = lastDetectMs * 0.7 + m.ms * 0.3;
+  if (cam && m.codes.length) handleCodes(m.codes);
+}
 const IDLE_MS = 60 * 1000;       // 1분 동안 바코드가 안 보이면 카메라 자동 꺼짐
 let lastActive = Date.now();
 const recent = new Map();   // 최근 인식한 코드 -> 시각 (같은 물건 반복 처리 방지)
@@ -524,8 +590,12 @@ function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 async function startCam() {
   if (cam) return;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { showCamError('이 브라우저는 카메라를 지원하지 않습니다. 크롬이나 사파리로 열어 주세요.'); return; }
-  try { if (!detector) detector = await makeDetector(); }
-  catch (e) { showCamError('바코드 인식기를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침하세요.'); return; }
+  $('#camMsg').textContent = '인식기 준비 중…';
+  const okWorker = await startWorker();
+  if (!okWorker) {
+    try { if (!detector) detector = await makeDetector(); }
+    catch (e) { showCamError('바코드 인식기를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침하세요.'); return; }
+  }
 
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -578,6 +648,7 @@ async function applyZoom(val) {
 
 function stopCam(keepPref) {
   $('#sleepBtn').hidden = true;
+  inflight = false;
   clearTimeout(loopTimer); loopTimer = null;
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; track = null; cam = false; torchOn = false;
@@ -588,36 +659,46 @@ function stopCam(keepPref) {
   if (!keepPref) lsSet('sort_cam', '0');
 }
 
-/** 화면 전체를 판독 (상자에 맞추지 않아도 어디에 있든, 기울어져도 인식).
- *  너무 큰 프레임만 1920px로 줄여 속도 유지. 라벨에 바코드가 여러 개면 handleCodes가 송장만 골라냄 */
-function grabFrame(v) {
+/** 화면 전체를 판독용 크기(960px)로 줄여 픽셀 데이터로 꺼냄 (화면 표시 화질은 그대로) */
+function frameData(v) {
   const vw = v.videoWidth, vh = v.videoHeight;
   if (!vw || !vh) return null;
-  const k = Math.min(1, 1280 / Math.max(vw, vh));
+  const k = Math.min(1, DETECT_MAX / Math.max(vw, vh));
   const cw = Math.round(vw * k), ch = Math.round(vh * k);
   if (cropCanvas.width !== cw) cropCanvas.width = cw;
   if (cropCanvas.height !== ch) cropCanvas.height = ch;
   cropCtx.drawImage(v, 0, 0, vw, vh, 0, 0, cw, ch);
-  return cropCanvas;
+  return cropCtx.getImageData(0, 0, cw, ch);
 }
 
 async function tick() {
   if (!cam) return;
   const v = $('#camVideo');
-  if (!busy && v.readyState >= 2) {
-    busy = true;
-    try {
-      let found = null;
-      if (useVideoDirect) {           // 영상 그대로 판독 (복사 단계 생략 → 더 빠름)
-        try { found = await detector.detect(v); } catch (e) { useVideoDirect = false; }
+  if (inflight && Date.now() - inflightAt > 3000) inflight = false;      // 응답이 멈춘 경우 복구
+  if (!inflight && v.readyState >= 2) {
+    if (worker) {
+      const img = frameData(v);
+      if (img) {
+        inflight = true; inflightAt = Date.now();
+        worker.postMessage({ type: 'frame', w: img.width, h: img.height, buf: img.data.buffer }, [img.data.buffer]);
       }
-      if (!found) { const src = grabFrame(v); if (src) found = await detector.detect(src); }
-      if (found) handleCodes(found.map(c => String(c.rawValue || '').trim()).filter(Boolean));
-    } catch (e) {}
-    busy = false;
+    } else if (detector) {                                               // 백그라운드를 못 쓰는 기기: 기존 방식
+      inflight = true; inflightAt = Date.now();
+      const t = performance.now();
+      try {
+        const img = frameData(v);
+        const found = img ? await detector.detect(img) : [];
+        handleCodes(found.map(c => String(c.rawValue || '').trim()).filter(Boolean));
+      } catch (e) {}
+      lastDetectMs = lastDetectMs * 0.7 + (performance.now() - t) * 0.3;
+      inflight = false;
+    }
   }
   if (Date.now() - lastActive > IDLE_MS) { sleepCam(); return; }
-  loopTimer = setTimeout(tick, Date.now() - lastHit < FAST_WINDOW ? FAST_MS : SLOW_MS);
+  const base = Date.now() - lastHit < FAST_WINDOW ? FAST_MS : SLOW_MS;
+  // 기기 성능에 맞춰 자동 조절: 판독이 느린 휴대폰은 간격을 넓혀 화면 그릴 시간을 확보
+  const gap = worker ? Math.max(base, lastDetectMs * 0.8) : Math.max(base, lastDetectMs * 2.5);
+  loopTimer = setTimeout(tick, Math.min(gap, 600));
 }
 
 function handleCodes(list) {
