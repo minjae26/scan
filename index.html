@@ -193,18 +193,22 @@ const S = {
 };
 
 /* ───────── 구글 시트 연결 (Apps Script 연결 창구) ─────────
- * 연결 링크 형식: https://<이 페이지 주소>/#u=<웹앱 URL>&k=<비밀 키>
+ * 접속 링크 형식: https://minjae26.github.io/scan/#k=<비밀 키>   (예전 형식 #u=...&k=... 도 그대로 동작)
+ * 웹 앱 주소는 아래에 미리 넣어 둠 — 비밀 정보가 아님 (비밀 키 + 작업자 비밀번호 없이는 아무것도 볼 수 없음)
  * 링크로 한 번 열면 이 기기에 저장되고, 주소창에서는 키가 지워집니다.
  */
+const DEFAULT_API_URL = 'https://script.google.com/macros/s/AKfycbyhIM6HUdF60L1U8Wzauta7mXfLNkkSPCaoDReTYR5J3uIi3OdnFFG8nXGIGkxOyL0u/exec';
 const CFG = { url: '', key: '' };
 (function readConfig() {
   try { CFG.url = localStorage.getItem('sort_api_url') || ''; CFG.key = localStorage.getItem('sort_api_key') || ''; } catch (e) {}
   const h = new URLSearchParams(location.hash.slice(1));
-  if (h.get('u') && h.get('k')) {
-    CFG.url = h.get('u').trim(); CFG.key = h.get('k').trim();
+  if (h.get('k')) {
+    CFG.url = (h.get('u') || '').trim() || DEFAULT_API_URL;
+    CFG.key = h.get('k').trim();
     try { localStorage.setItem('sort_api_url', CFG.url); localStorage.setItem('sort_api_key', CFG.key); } catch (e) {}
     history.replaceState(null, '', location.pathname + location.search);
   }
+  if (!CFG.url && CFG.key) CFG.url = DEFAULT_API_URL;
 })();
 
 const API_ARGS = { getAll: [], scan: ['code'], scanBatch: ['codes'], cancelScan: ['inv'], getUpdates: ['n'], login: ['pin'] };
@@ -253,7 +257,7 @@ function askLogin(msg) {
 }
 
 function openConnDialog() {
-  $('#connUrl').value = CFG.url; $('#connKey').value = CFG.key;
+  $('#connUrl').value = CFG.url && CFG.url !== DEFAULT_API_URL ? CFG.url : ''; $('#connKey').value = CFG.key;
   $('#connDlg').showModal();
 }
 
@@ -841,15 +845,18 @@ $('#connCancel').onclick = () => $('#connDlg').close();
 $('#connForm').onsubmit = async e => {
   e.preventDefault();
   const raw = $('#connUrl').value.trim();
+  const keyIn = $('#connKey').value.trim();
   const hashAt = raw.indexOf('#');
-  if (hashAt >= 0) {               // 연결 링크 전체를 붙여넣은 경우: 주소와 키를 자동으로 분리
+  if (hashAt >= 0) {               // 접속 링크 전체를 붙여넣은 경우: 키(와 주소)를 자동으로 꺼냄
     const h = new URLSearchParams(raw.slice(hashAt + 1));
-    if (h.get('u')) CFG.url = h.get('u').trim();
-    if (h.get('k')) CFG.key = h.get('k').trim();
-  } else {
-    CFG.url = raw; CFG.key = $('#connKey').value.trim();
+    CFG.url = (h.get('u') || '').trim() || DEFAULT_API_URL;
+    CFG.key = (h.get('k') || '').trim() || keyIn;
+  } else if (/^https?:\/\//i.test(raw)) {   // 웹 앱 주소를 직접 입력한 경우
+    CFG.url = raw; CFG.key = keyIn;
+  } else {                          // 첫 칸을 비우거나 비밀 키만 넣은 경우
+    CFG.url = DEFAULT_API_URL; CFG.key = keyIn || raw;
   }
-  if (!CFG.url || !CFG.key) { alert('연결 링크를 그대로 붙여넣거나, 웹 앱 URL과 비밀 키를 모두 입력하세요.'); return; }
+  if (!CFG.key) { alert('문자로 받은 접속 링크를 붙여넣거나, 비밀 키를 입력하세요.'); return; }
   try { localStorage.setItem('sort_api_url', CFG.url); localStorage.setItem('sort_api_key', CFG.key); } catch (err) {}
   $('#connDlg').close();
   if (!AUTH.token) { askLogin(); return; }
