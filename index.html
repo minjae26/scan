@@ -117,7 +117,7 @@
     <div class="row" id="zoomRow" hidden style="margin-top:8px">
       <span class="sub" style="white-space:nowrap">확대</span><input type="range" id="zoom" style="padding:0">
     </div>
-    <div class="sub" id="camHint" style="margin-top:6px">화면 안 어디에 있든 송장 바코드가 보이면 자동으로 인식됩니다. 1분 동안 스캔이 없으면 발열을 줄이려고 카메라가 꺼집니다.</div>
+    <div class="sub" id="camHint" style="margin-top:6px">화면 안 어디에 있든 송장 바코드나 QR코드가 보이면 자동으로 인식됩니다. 1분 동안 스캔이 없으면 발열을 줄이려고 카메라가 꺼집니다.</div>
   </div>
 
   <div class="result" id="result">
@@ -301,7 +301,16 @@ async function loadAll() {
 }
 
 function findLocal(code) {
-  return S.byInv.get(code) || S.byLabel.get(code.toUpperCase()) || null;
+  const c = String(code || '').trim();
+  const hit = S.byInv.get(c) || S.byLabel.get(c.toUpperCase());
+  if (hit) return hit;
+  // QR코드처럼 주소·긴 글이 들어 있는 경우: 그 안에서 송장번호나 라벨(예: 2011000-6)을 찾음
+  if (c.length > 6) {
+    const tokens = c.toUpperCase().match(/[0-9A-Z가-힣]+(?:-[0-9A-Z가-힣]+)*/g) || [];
+    for (const t of tokens) { const r = S.byInv.get(t) || S.byLabel.get(t); if (r) return r; }
+    for (const d of (c.match(/\d{6,}/g) || [])) { const r = S.byInv.get(d); if (r) return r; }
+  }
+  return null;
 }
 function orderStat(order) {
   const o = S.orders.get(order); if (!o) return { done: 0, total: 0 };
